@@ -125,7 +125,6 @@ Write (1<<TWINT) | (1<<TWEA) | (1<<TWEN).
 	For last byte – clear TWEA before clearing TWINT (send NACK to slave).
 Write (1<<TWINT) | (1<<TWEN) (i.e., TWEA=0).
 	Stop – same as MT.
-⚠️ Critical Correction: In Master Receiver mode, the core drives SDA low when TWEA = 1 (ACK) and high Z when TWEA = 0 (NACK). This polarity is already fixed in this IP version.
 ________________________________________
 6.3 Slave Receiver & Transmitter
 	Initialize – Set TWAR with own address. Write (1<<TWEA) | (1<<TWEN) to TWCR.
