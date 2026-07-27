@@ -9,6 +9,8 @@ VHDL Libraries:
   * fixed_mul_32x32 - 3-stage pipelined Q16.16 x Q16.16 multiplier with overflow saturation
   * fixed_mul_64x64 - 4-stage pipelined Q32.32 x Q32.32 multiplier with overflow detection and saturation
   * fixed_sqrt - 49-stage pipelined radix-2 restoring square root for Q32.32 fixed-point
+  * fixd_util - Fixed-point utility functions: unit conversions, angle limiters and inverse operations
+    
 2- Interfaces:
   * SPI
   * USART
