@@ -4,3 +4,4 @@ VHDL Libraries:
 2- Interfaces:
   * SPI
   * USART
+  * TWI or I2C
