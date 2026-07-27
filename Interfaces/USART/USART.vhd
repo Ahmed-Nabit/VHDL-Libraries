@@ -1,5 +1,5 @@
 -- =====================================================================
--- USART - Production-oriented ATmega-compatible implementation
+-- USART - ATmega16 compatible implementation
 -- =====================================================================
 -- Features implemented:
 --   * Asynchronous and synchronous operation
