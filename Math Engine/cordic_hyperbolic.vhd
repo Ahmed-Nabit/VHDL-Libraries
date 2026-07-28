@@ -1,4 +1,4 @@
--- cordic_hyperbolic.vhd
+-- cordic_hyperbolic.vhd (fully corrected)
 -- Single‑shot CORDIC hyperbolic core for ln(x) and exp(x) (Q32.32)
 -- Uses fixed_mul_64x64 for all multiplications. No combinational '*'.
 -- Features:
@@ -8,7 +8,6 @@
 --   - Overflow detection for invalid input or result out of range
 --   - Proper handshake: start, busy, done
 --   - abort resets the operation
---   - timeout tied to '0'
 -- Copyright © 2024-2026 Ahmed Nabit <Lazrdo@gmail.com>
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
@@ -46,30 +45,102 @@ architecture seq of cordic_hyperbolic is
     -- Q32.32 constants
     constant ONE_Q      : q32_32 := x"0000000100000000";
     constant LN2_Q      : q32_32 := x"00000000B17217F7";
-    constant INV_HYPERB_GAIN : q32_32 := x"00000001351A3F6A";   -- 1/K_h
-    constant INV_LN2     : q32_32 := x"00000001721F6703";       -- 1/ln(2)
+    constant INV_HYPERB_GAIN : q32_32 := x"00000000D402407C";   -- 1/K_h
+    constant INV_LN2    : q32_32 := x"0000000171547646";       -- 1/ln(2)
 
     -- ATANH table (40 entries, repeats at i=4,13)
     type atanh_table_t is array(0 to 39) of q32_32;
-    constant ATANH_TABLE : atanh_table_t := (
-        x"000000008CA6C1D1", x"000000004162BE2B", x"000000002027C8B2", x"0000000010046F8F",
-        x"0000000010046F8F", x"000000000800F6B2", x"0000000004007B50", x"0000000002001EF0",
-        x"0000000001000F78", x"00000000008007BC", x"00000000004003DE", x"00000000002001EF",
-        x"00000000001000F8", x"00000000001000F8", x"000000000008007C", x"000000000004003E",
-        x"000000000002001F", x"0000000000010010", x"0000000000008008", x"0000000000004004",
-        x"0000000000002002", x"0000000000001001", x"0000000000000800", x"0000000000000400",
-        x"0000000000000200", x"0000000000000100", x"0000000000000080", x"0000000000000040",
-        x"0000000000000020", x"0000000000000010", x"0000000000000008", x"0000000000000004",
-        x"0000000000000002", x"0000000000000001", others => (others => '0')
-    );
+	constant ATANH_TABLE : atanh_table_t := (
+		-- i=0,  s=1
+		x"000000008CA6C1D2",
+		-- i=1,  s=2
+		x"000000004161E52E",
+		-- i=2,  s=3
+		x"000000002027C8B2",
+		-- i=3,  s=4
+		x"0000000010046F8F",
+		-- i=4,  s=4 (repeat)
+		x"0000000010046F8F",
+		-- i=5,  s=5
+		x"000000000800AAC4",
+		-- i=6,  s=6
+		x"0000000004001556",
+		-- i=7,  s=7
+		x"00000000020002AB",
+		-- i=8,  s=8
+		x"0000000001000055",
+		-- i=9,  s=9
+		x"000000000080000B",
+		-- i=10, s=10
+		x"0000000000400001",
+		-- i=11, s=11
+		x"0000000000200000",
+		-- i=12, s=12
+		x"0000000000100000",
+		-- i=13, s=13
+		x"0000000000080000",
+		-- i=14, s=13 (repeat)
+		x"0000000000080000",
+		-- i=15, s=14
+		x"0000000000040000",
+		-- i=16, s=15
+		x"0000000000020000",
+		-- i=17, s=16
+		x"0000000000010000",
+		-- i=18, s=17
+		x"0000000000008000",
+		-- i=19, s=18
+		x"0000000000004000",
+		-- i=20, s=19
+		x"0000000000002000",
+		-- i=21, s=20
+		x"0000000000001000",
+		-- i=22, s=21
+		x"0000000000000800",
+		-- i=23, s=22
+		x"0000000000000400",
+		-- i=24, s=23
+		x"0000000000000200",
+		-- i=25, s=24
+		x"0000000000000100",
+		-- i=26, s=25
+		x"0000000000000080",
+		-- i=27, s=26
+		x"0000000000000040",
+		-- i=28, s=27
+		x"0000000000000020",
+		-- i=29, s=28
+		x"0000000000000010",
+		-- i=30, s=29
+		x"0000000000000008",
+		-- i=31, s=30
+		x"0000000000000004",
+		-- i=32, s=31
+		x"0000000000000002",
+		-- i=33, s=32
+		x"0000000000000001",
+		-- i=34, s=33 (rounded up from 0.5)
+		x"0000000000000001",
+		-- i=35, s=34
+		x"0000000000000000",
+		-- i=36, s=35
+		x"0000000000000000",
+		-- i=37, s=36
+		x"0000000000000000",
+		-- i=38, s=37
+		x"0000000000000000",
+		-- i=39, s=38
+		x"0000000000000000"
+	);
 
+    -- Corrected shift table: repeat i=4 and i=13
     type shift_table_t is array(0 to 39) of integer range 0 to 38;
     constant SHIFT_TABLE : shift_table_t := (
-        1,2,3,4,4,5,6,7,8,9,10,11,12,12,13,14,15,16,17,18,
+        1,2,3,4,4,5,6,7,8,9,10,11,12,13,13,14,15,16,17,18,
         19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38
     );
 
-    subtype q32_32_int is signed(65 downto 0);
+    subtype q32_32_int is signed(65 downto 0);  -- 66-bit signed with 2 guard bits
 
     -- FSM states
     type state_t is (IDLE,
@@ -79,6 +150,7 @@ architecture seq of cordic_hyperbolic is
                      EXP_SPLIT_MUL1,
                      EXP_SPLIT_MUL2,
                      EXP_ITERATE,
+                     EXP_GAIN_MUL,
                      EXP_FINAL_MUL,
                      FINISH);
     signal state : state_t := IDLE;
@@ -91,6 +163,7 @@ architecture seq of cordic_hyperbolic is
     signal ln_exp_reg : signed(31 downto 0) := (others => '0');
     signal overflow_reg : std_logic := '0';
     signal exp_r_result : q32_32 := (others => '0');
+    signal exp_r_corrected : q32_32 := (others => '0');
 
     -- For ln normalization (combinatorial, but stored in registers)
     signal mantissa : q32_32 := (others => '0');
@@ -137,6 +210,12 @@ architecture seq of cordic_hyperbolic is
             abort    : in  std_logic
         );
     end component;
+
+    -- Helper to convert a signed integer to Q32.32 (shift left by 32)
+    function int_to_q32_32(v : signed(31 downto 0)) return q32_32 is
+    begin
+        return resize(shift_left(v, 32), 64);
+    end function;
 
 begin
 
@@ -203,7 +282,6 @@ begin
                 return shift_left(to_signed(1, 64), shift_amt + 32);
             end if;
         else
-            -- k negative: 2^k = 2^(k+32) in fixed-point, but k+32 may be negative
             if shift_amt <= -32 then
                 return (others => '0');       -- underflow to 0
             else
@@ -214,13 +292,14 @@ begin
 
     -- Main FSM
     process(clk)
-        -- Variables for temporary calculations (avoid signal update races)
+        -- Variables for temporary calculations
         variable v_k : signed(31 downto 0);
         variable v_r : q32_32;
         variable v_overflow : std_logic;
         variable v_sum : signed(127 downto 0);
         variable v_round_bit : std_logic;
         variable v_q96 : signed(95 downto 0);
+        variable v_sum66 : signed(65 downto 0);  -- for x+y
     begin
         if rising_edge(clk) then
             if rst = '1' or abort = '1' then
@@ -231,9 +310,9 @@ begin
                 overflow_r <= '0';
                 iter_cnt <= 0;
                 mul_start <= '0';
-                mul_abort <= '1';   -- abort multiplier on reset
+                mul_abort <= '1';
             else
-                mul_abort <= '0';   -- clear after reset
+                mul_abort <= '0';
                 case state is
                     when IDLE =>
                         busy_r <= '0';
@@ -271,10 +350,9 @@ begin
                             -- wait
                         elsif mul_done = '1' then
                             mul1_result <= mul_result;
-                            -- Use variables to compute k and r
                             v_k := mul_result(63 downto 32);  -- integer part
                             -- Start second multiplication: k * LN2_Q
-                            mul_a <= resize(v_k, 64);
+                            mul_a <= int_to_q32_32(v_k);
                             mul_b <= LN2_Q;
                             mul_start <= '1';
                             state <= EXP_SPLIT_MUL2;
@@ -298,7 +376,8 @@ begin
                             end if;
                             k_int <= v_k;
                             r_frac <= v_r;
-                            if v_k > 31 or (v_k = 31 and v_r > 0) then
+                            -- Overflow if k >= 31 (2^31 out of signed Q32.32 range)
+                            if v_k >= 31 then
                                 v_overflow := '1';
                             else
                                 v_overflow := '0';
@@ -311,7 +390,7 @@ begin
                                 mode_reg <= '1';
                                 ln_exp_reg <= v_k;
                                 overflow_reg <= '0';
-                                x_reg <= resize(INV_HYPERB_GAIN, 66);
+                                x_reg <= resize(ONE_Q, 66);
                                 y_reg <= (others => '0');
                                 z_reg <= v_r;
                                 state <= EXP_ITERATE;
@@ -324,40 +403,42 @@ begin
                         if iter_cnt = 40 then
                             if mode_reg = '0' then
                                 -- ln: need final multiplication ln_exp_reg * LN2_Q
-                                mul_a <= resize(ln_exp_reg, 64);
+                                mul_a <= int_to_q32_32(ln_exp_reg);
                                 mul_b <= LN2_Q;
                                 mul_start <= '1';
                                 state <= LN_FINAL_MUL;
                             else
-                                -- exp: compute exp(r) = x+y
-                                v_sum := resize(x_reg + y_reg, 128);
-                                v_round_bit := v_sum(31);
-                                exp_r_result <= resize(shift_right(v_sum + (0 => v_round_bit, others => '0'), 32), 64);
-                                -- Prepare final scaling: exp(r) * 2^k
+                                -- exp: compute exp(r) from x+y (which is K_h*exp(r))
+                                v_sum66 := x_reg + y_reg;
+                                exp_r_result <= v_sum66(63 downto 0);
+                                -- Multiply by 1/K_h to correct gain
                                 mul_a <= exp_r_result;
-                                mul_b <= two_pow_k_q32(ln_exp_reg);
+                                mul_b <= INV_HYPERB_GAIN;
                                 mul_start <= '1';
-                                state <= EXP_FINAL_MUL;
+                                state <= EXP_GAIN_MUL;
                             end if;
                         else
-                            -- Perform one CORDIC iteration
+                            -- Perform one CORDIC iteration with CORRECTED signs
+                            --   For rotation (exp):  if z>=0 then d=+1 else d=-1
+                            --   For vectoring (ln):  if y>=0 then d=-1 else d=+1
+                            -- In both cases, x and y updates use the same d.
                             if mode_reg = '1' then   -- rotation (exp)
-                                if z_reg >= 0 then
-                                    x_reg <= x_reg - shift_right(y_reg, SHIFT_TABLE(iter_cnt));
+                                if z_reg >= 0 then   -- d = +1
+                                    x_reg <= x_reg + shift_right(y_reg, SHIFT_TABLE(iter_cnt));
                                     y_reg <= y_reg + shift_right(x_reg, SHIFT_TABLE(iter_cnt));
                                     z_reg <= z_reg - ATANH_TABLE(iter_cnt);
-                                else
-                                    x_reg <= x_reg + shift_right(y_reg, SHIFT_TABLE(iter_cnt));
+                                else                 -- d = -1
+                                    x_reg <= x_reg - shift_right(y_reg, SHIFT_TABLE(iter_cnt));
                                     y_reg <= y_reg - shift_right(x_reg, SHIFT_TABLE(iter_cnt));
                                     z_reg <= z_reg + ATANH_TABLE(iter_cnt);
                                 end if;
                             else                       -- vectoring (ln)
-                                if y_reg >= 0 then
-                                    x_reg <= x_reg + shift_right(y_reg, SHIFT_TABLE(iter_cnt));
+                                if y_reg >= 0 then   -- d = -1
+                                    x_reg <= x_reg - shift_right(y_reg, SHIFT_TABLE(iter_cnt));
                                     y_reg <= y_reg - shift_right(x_reg, SHIFT_TABLE(iter_cnt));
                                     z_reg <= z_reg + ATANH_TABLE(iter_cnt);
-                                else
-                                    x_reg <= x_reg - shift_right(y_reg, SHIFT_TABLE(iter_cnt));
+                                else                 -- d = +1
+                                    x_reg <= x_reg + shift_right(y_reg, SHIFT_TABLE(iter_cnt));
                                     y_reg <= y_reg + shift_right(x_reg, SHIFT_TABLE(iter_cnt));
                                     z_reg <= z_reg - ATANH_TABLE(iter_cnt);
                                 end if;
@@ -376,10 +457,31 @@ begin
                             v_q96 := resize(z_reg, 96);
                             v_q96 := shift_left(v_q96, 1);
                             v_q96 := v_q96 + resize(mul3_result, 96);
-                            v_round_bit := v_q96(31);
-                            result_r <= resize(shift_right(v_q96 + (0 => v_round_bit, others => '0'), 32), 64);
-                            overflow_r <= '0';
+                            -- Check overflow of the 96-bit sum
+                            if (v_q96(95 downto 64) /= (95 downto 64 => v_q96(63))) then
+                                overflow_r <= '1';
+                            else
+                                overflow_r <= '0';
+                            end if;
+                            -- OR with multiplier overflow (if any)
+                            overflow_r <= overflow_r or mul_overflow;
+                            -- take lower 64 bits (Q32.32)
+                            result_r <= v_q96(63 downto 0);
                             state <= FINISH;
+                        end if;
+
+                    -- ========== EXP gain correction ==========
+                    when EXP_GAIN_MUL =>
+                        mul_start <= '0';
+                        if mul_busy = '1' then
+                            -- wait
+                        elsif mul_done = '1' then
+                            exp_r_corrected <= mul_result;
+                            -- Start final scaling: exp(r) * 2^k
+                            mul_a <= exp_r_corrected;
+                            mul_b <= two_pow_k_q32(ln_exp_reg);
+                            mul_start <= '1';
+                            state <= EXP_FINAL_MUL;
                         end if;
 
                     -- ========== EXP final multiplication ==========
@@ -397,6 +499,7 @@ begin
                     when FINISH =>
                         done_r <= '1';
                         busy_r <= '0';
+                        overflow_r <= overflow_reg;   -- propagate overflow from early termination
                         state <= IDLE;
 
                     when others =>
