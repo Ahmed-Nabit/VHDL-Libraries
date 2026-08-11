@@ -15,3 +15,4 @@ VHDL Libraries:
   * SPI
   * USART
   * TWI or I2C
+  * CAN
