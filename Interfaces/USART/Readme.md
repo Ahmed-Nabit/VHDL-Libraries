@@ -1,7 +1,4 @@
 USART IP Core – User Guide Manual
-Document Version: 1.0
-Core Version: Production‑Ready (ATmega‑compatible)
-Based On: Atmel AVR USART (ATmega16) Datasheet
 
 1. Overview
 This USART (Universal Synchronous and Asynchronous serial Receiver and Transmitter) IP core is a hardware‑accurate, production‑ready implementation of the AVR USART peripheral. It is designed for FPGA/ASIC integration and offers full compatibility with the ATmega16 USART, including all advanced features such as buffered error flags, multi‑processor communication, synchronous master/slave operation, and double‑speed asynchronous mode.
