@@ -1,7 +1,5 @@
 TWI (Two-Wire Interface) IP Core
 User Guide Manual
-Version 1.0
-Compliant with ATmega16(L) TWI Specification
 ________________________________________
 1. Introduction
 The TWI IP Core is a production ready RTL implementation of the Two Wire Serial Interface (I²C compatible) found in the ATmega16(L) microcontroller. It handles all bus timing, arbitration, clock stretching, and protocol framing in hardware, offloading the host processor to simple register reads/writes.
