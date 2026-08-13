@@ -1,20 +1,20 @@
 -- =====================================================================
--- USART - ATmega16 compatible implementation
+-- USART - Fixed, production-oriented implementation
 -- =====================================================================
--- Features implemented:
---   * Asynchronous and synchronous operation
---   * Synchronous master/slave with correct UCPOL edge relationship
---   * 5/6/7/8/9-bit characters
---   * No / even / odd parity
---   * 1 / 2 stop bits
---   * 2-level receive FIFO with buffered FE/DOR/PE/RXB8
---   * Correct status-before-UDR read behavior
---   * Majority-vote asynchronous receiver sampling
---   * Double-speed asynchronous mode
---   * TXC write-one-to-clear and interrupt acknowledge clear
---   * Transmitter disable completion semantics
---   * Immediate receiver disable and FIFO flush
---   * Shared UBRRH/UCSRC read/write access
+-- Coding constraints honored:
+--   * No natural or real numbers
+--   * No concurrent signal assignments
+--   * Variables are used for internal state and computations
+--   * All signal assignments are inside one process
+--
+-- Fixes included:
+--   * Atomic UDR read/write side effects
+--   * RXC / UDRE / TXC update timing made consistent
+--   * TXC no longer falsely set when a new UDR write occurs at frame end
+--   * DOR / receive-shift-register third-buffer corner cases handled
+--   * Synchronous back-to-back transmission gap removed
+--   * Shared UBRRH/UCSRC read sequence preserved
+--   * Added tx_oe for proper TxD pin override / production integration
 -- =====================================================================
 -- Copyright © 2024-2026 Ahmed Nabit <Lazrdo@gmail.com>
 -- Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,38 +29,38 @@
 
 library ieee;
 use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
 
 entity usart is
   port (
-    clk          : in  std_logic;
-    reset        : in  std_logic;  -- asynchronous active-high reset
+    clk        : in  std_logic;
+    reset      : in  std_logic;  -- asynchronous active-high reset
 
     -- Serial I/O
-    rx_in        : in  std_logic;
-    tx_out       : out std_logic;
+    rx_in      : in  std_logic;
+    tx_out     : out std_logic;
+    tx_oe      : out std_logic;
 
-    -- Synchronous clock I/O (production-friendly separate ports)
-    xck_in       : in  std_logic;
-    xck_out      : out std_logic;
-    xck_oe       : out std_logic;
-    ddr_xck      : in  std_logic;  -- 1 = master (output), 0 = slave (input)
+    -- Synchronous clock I/O
+    xck_in     : in  std_logic;
+    xck_out    : out std_logic;
+    xck_oe     : out std_logic;
+    ddr_xck    : in  std_logic;  -- 1 = master (output), 0 = slave (input)
 
     -- Register bus
-    addr         : in  std_logic_vector(3 downto 0);
-    din          : in  std_logic_vector(7 downto 0);
-    dout         : out std_logic_vector(7 downto 0);
-    we           : in  std_logic;
-    re           : in  std_logic;
+    addr       : in  std_logic_vector(3 downto 0);
+    din        : in  std_logic_vector(7 downto 0);
+    dout       : out std_logic_vector(7 downto 0);
+    we         : in  std_logic;
+    re         : in  std_logic;
 
     -- Interrupts
-    rx_irq       : out std_logic;
-    tx_irq       : out std_logic;
-    udre_irq     : out std_logic;
+    rx_irq     : out std_logic;
+    tx_irq     : out std_logic;
+    udre_irq   : out std_logic;
 
-    -- Transmit-complete interrupt acknowledge from CPU/interrupt controller.
+    -- Transmit-complete interrupt acknowledge.
     -- Drive to '0' if unused.
-    tx_irq_ack   : in  std_logic
+    tx_irq_ack : in  std_logic
   );
 end entity usart;
 
@@ -88,16 +88,16 @@ architecture rtl of usart is
     pe   : std_logic;
   end record;
 
-  type fifo_array_t is array (0 to 1) of fifo_entry_t;
+  type fifo_array_t is array (integer range 0 to 1) of fifo_entry_t;
 
   -- ===================================================================
-  -- Parity helpers
+  -- Helper functions (no natural / real, no to_integer)
   -- ===================================================================
   function parity_even(data : std_logic_vector; width : integer) return std_logic is
     variable p : std_logic;
   begin
     p := '0';
-    for i in 0 to width-1 loop
+    for i in 0 to width - 1 loop
       p := p xor data(i);
     end loop;
     return p;
@@ -108,1228 +108,1245 @@ architecture rtl of usart is
     return not parity_even(data, width);
   end function;
 
-  -- ===================================================================
-  -- Control registers
-  -- ===================================================================
+  function slv_to_int(v : std_logic_vector) return integer is
+    variable r : integer range 0 to 4095;
+  begin
+    r := 0;
+    for i in v'range loop
+      r := r * 2;
+      if v(i) = '1' then
+        r := r + 1;
+      end if;
+    end loop;
+    return r;
+  end function;
 
-  -- UCSRA writable bits
-  signal U2X   : std_logic := '0';
-  signal MPCM  : std_logic := '0';
+  function int_to_slv8(v : integer) return std_logic_vector is
+    variable r : std_logic_vector(7 downto 0);
+    variable x : integer;
+  begin
+    x := v;
+    r := (others => '0');
+    for i in 0 to 7 loop
+      if (x rem 2) = 1 then
+        r(i) := '1';
+      else
+        r(i) := '0';
+      end if;
+      x := x / 2;
+    end loop;
+    return r;
+  end function;
 
-  -- UCSRB
-  signal RXCIE : std_logic := '0';
-  signal TXCIE : std_logic := '0';
-  signal UDRIE : std_logic := '0';
-  signal RXEN  : std_logic := '0';
-  signal TXEN  : std_logic := '0';
-  signal UCSZ2 : std_logic := '0';
-  signal TXB8  : std_logic := '0';
-
-  -- UCSRC
-  signal UMSEL : std_logic := '0';
-  signal UPM1  : std_logic := '0';
-  signal UPM0  : std_logic := '0';
-  signal USBS  : std_logic := '0';
-  signal UCSZ1 : std_logic := '1';
-  signal UCSZ0 : std_logic := '1';
-  signal UCPOL : std_logic := '0';
-
-  -- UBRR
-  signal UBRR     : unsigned(11 downto 0) := (others => '0');
-  signal ubrr_val : integer range 0 to 4095 := 0;
-
-  -- ===================================================================
-  -- Frame configuration
-  -- ===================================================================
-  signal char_bits       : integer range 5 to 9 := 8;
-  signal parity_en       : boolean := false;
-  signal samples_per_bit : integer range 8 to 16 := 16;
-
-  -- 0-based sample indices:
-  -- Normal mode uses samples 8,9,10 -> indices 7,8,9
-  -- Double speed uses samples 4,5,6 -> indices 3,4,5
-  signal sample_first_idx  : integer range 0 to 15 := 7;
-  signal sample_center_idx : integer range 0 to 15 := 8;
-  signal sample_last_idx   : integer range 0 to 15 := 9;
-
-  -- ===================================================================
-  -- Bus handshakes / pulses
-  -- ===================================================================
-  signal udr_write_pulse  : std_logic := '0';
-  signal udr_write_data   : std_logic_vector(7 downto 0) := (others => '0');
-  signal txc_clear_pulse  : std_logic := '0';
-  signal ubrrl_write_pulse: std_logic := '0';
-  signal fifo_pop         : std_logic := '0';
-  signal prev_read_shared : std_logic := '0';
-
-  -- ===================================================================
-  -- Transmitter internals
-  -- ===================================================================
-  signal tx_state         : tx_state_t := TX_IDLE;
-  signal tx_shift         : std_logic_vector(8 downto 0) := (others => '0');
-  signal tx_bit_cnt       : integer range 0 to 8 := 0;
-  signal tx_buf           : std_logic_vector(8 downto 0) := (others => '0');
-  signal tx_buf_full      : std_logic := '0';
-  signal udre_i           : std_logic := '1';
-  signal txc_i            : std_logic := '0';
-  signal tx_timer         : integer range 0 to 65535 := 0;
-  signal tx_sync_first    : std_logic := '0';
-
-  -- Latched frame parameters for the frame currently being transmitted
-  signal tx_char_bits_l   : integer range 5 to 9 := 8;
-  signal tx_parity_en_l   : boolean := false;
-  signal tx_odd_l         : std_logic := '0';
-  signal tx_stop2_l       : std_logic := '0';
-  signal tx_parity_bit    : std_logic := '0';
-
-  -- ===================================================================
-  -- Receiver internals
-  -- ===================================================================
-  signal rx_state         : rx_state_t := RX_IDLE;
-  signal rx_sync          : std_logic_vector(2 downto 0) := (others => '0');
-  signal rx_shift         : std_logic_vector(8 downto 0) := (others => '0');
-  signal rx_bit_cnt       : integer range 0 to 8 := 0;
-  signal rx_s0            : std_logic := '0';
-  signal rx_s1            : std_logic := '0';
-  signal rx_pe_latched    : std_logic := '0';
-
-  signal rx_shift_full    : std_logic := '0';
-  signal rx_dor_pending   : std_logic := '0';
-
-  -- Latched frame parameters for the frame currently being received
-  signal rx_char_bits_l   : integer range 5 to 9 := 8;
-  signal rx_parity_en_l   : boolean := false;
-  signal rx_odd_l         : std_logic := '0';
-  signal rx_mpcm_l        : std_logic := '0';
-
-  -- Pending frame held in the receive shift register when FIFO is full
-  signal rx_pending_data  : std_logic_vector(8 downto 0) := (others => '0');
-  signal rx_pending_fe    : std_logic := '0';
-  signal rx_pending_dor   : std_logic := '0';
-  signal rx_pending_pe    : std_logic := '0';
-
-  signal rx_start_reset   : std_logic := '0';
-
-  -- ===================================================================
-  -- Receive FIFO
-  -- ===================================================================
-  signal fifo             : fifo_array_t;
-  signal fifo_wr_ptr      : integer range 0 to 1 := 0;
-  signal fifo_rd_ptr      : integer range 0 to 1 := 0;
-  signal fifo_cnt         : integer range 0 to 2 := 0;
-
-  signal fifo_push        : std_logic := '0';
-  signal fifo_push_data   : std_logic_vector(8 downto 0) := (others => '0');
-  signal fifo_push_fe     : std_logic := '0';
-  signal fifo_push_dor    : std_logic := '0';
-  signal fifo_push_pe     : std_logic := '0';
-
-  signal fifo_full_i      : std_logic := '0';
-  signal fifo_empty_i     : std_logic := '1';
-
-  signal rxc_i            : std_logic := '0';
-  signal head_data        : std_logic_vector(8 downto 0) := (others => '0');
-  signal head_fe          : std_logic := '0';
-  signal head_dor         : std_logic := '0';
-  signal head_pe          : std_logic := '0';
-  signal rxb8_i           : std_logic := '0';
-
-  -- ===================================================================
-  -- Baud / sample generator
-  -- ===================================================================
-  signal rx_sample_tick   : std_logic := '0';
-  signal rx_sample_pos    : integer range 0 to 15 := 0;
-
-  -- ===================================================================
-  -- Synchronous clock generator / edge detection
-  -- ===================================================================
-  signal xck_sync         : std_logic_vector(2 downto 0) := (others => '0');
-  signal xck_q            : std_logic := '0';
-  signal xck_cnt          : integer range 0 to 4095 := 0;
-
-  signal master_run_i          : std_logic := '0';
-  signal master_edge_event     : std_logic := '0';
-  signal master_rising_event   : std_logic := '0';
-  signal master_falling_event  : std_logic := '0';
-
-  signal slave_rising_event    : std_logic := '0';
-  signal slave_falling_event   : std_logic := '0';
-
-  signal xck_change_event      : std_logic := '0';
-  signal xck_sample_event      : std_logic := '0';
+  function int_to_slv4(v : integer) return std_logic_vector is
+    variable r : std_logic_vector(3 downto 0);
+    variable x : integer;
+  begin
+    x := v;
+    r := (others => '0');
+    for i in 0 to 3 loop
+      if (x rem 2) = 1 then
+        r(i) := '1';
+      else
+        r(i) := '0';
+      end if;
+      x := x / 2;
+    end loop;
+    return r;
+  end function;
 
 begin
 
   -- ===================================================================
-  -- Derived configuration
+  -- Single process containing all state and behavior
   -- ===================================================================
-  with (UCSZ2 & UCSZ1 & UCSZ0) select
-    char_bits <=
-      5 when "000",
-      6 when "001",
-      7 when "010",
-      8 when "011",
-      9 when "111",
-      8 when others;  -- reserved values treated as 8-bit for safe synthesis
+  main_proc : process (clk, reset) is
 
-  parity_en <= (UPM1 = '1');
+    -------------------------------------------------------------------
+    -- Control registers
+    -------------------------------------------------------------------
+    variable u2x_q   : std_logic := '0';
+    variable mpcm_q  : std_logic := '0';
 
-  samples_per_bit <= 8 when (U2X = '1' and UMSEL = '0') else 16;
+    variable rxcie_q : std_logic := '0';
+    variable txcie_q : std_logic := '0';
+    variable udrie_q : std_logic := '0';
+    variable rxen_q  : std_logic := '0';
+    variable txen_q  : std_logic := '0';
+    variable ucsz2_q : std_logic := '0';
+    variable txb8_q  : std_logic := '0';
 
-  sample_first_idx  <= 3 when samples_per_bit = 8 else 7;
-  sample_center_idx <= 4 when samples_per_bit = 8 else 8;
-  sample_last_idx   <= 5 when samples_per_bit = 8 else 9;
+    variable umsel_q : std_logic := '0';
+    variable upm1_q  : std_logic := '0';
+    variable upm0_q  : std_logic := '0';
+    variable usbs_q  : std_logic := '0';
+    variable ucsz1_q : std_logic := '1';
+    variable ucsz0_q : std_logic := '1';
+    variable ucpol_q : std_logic := '0';
 
-  ubrr_val <= to_integer(UBRR);
+    variable ubrr_q : integer range 0 to 4095 := 0;
 
-  -- ===================================================================
-  -- Interrupt outputs
-  -- ===================================================================
-  rx_irq   <= rxc_i and RXCIE;
-  tx_irq   <= txc_i and TXCIE;
-  udre_irq <= udre_i and UDRIE;
+    -------------------------------------------------------------------
+    -- Shared register read sequence
+    -------------------------------------------------------------------
+    variable prev_shared_q : boolean := false;
 
-  -- ===================================================================
-  -- Synchronous clock control signals
-  -- ===================================================================
-  master_run_i <= '1' when (UMSEL = '1' and ddr_xck = '1' and
-                            (TXEN = '1' or RXEN = '1' or
-                             (tx_state /= TX_IDLE) or
-                             (tx_buf_full = '1') or
-                             (rx_state /= RX_IDLE))) else '0';
+    -------------------------------------------------------------------
+    -- Bus / output register
+    -------------------------------------------------------------------
+    variable dout_q : std_logic_vector(7 downto 0) := (others => '0');
 
-  master_edge_event <= '1' when (master_run_i = '1' and xck_cnt >= ubrr_val) else '0';
+    -------------------------------------------------------------------
+    -- Transmitter state
+    -------------------------------------------------------------------
+    variable tx_state_q       : tx_state_t := TX_IDLE;
+    variable tx_out_q         : std_logic := '1';
+    variable txc_q            : std_logic := '0';
+    variable udre_q           : std_logic := '1';
+    variable tx_buf_full_q    : std_logic := '0';
+    variable tx_buf_q         : std_logic_vector(8 downto 0) := (others => '0');
+    variable tx_shift_q       : std_logic_vector(8 downto 0) := (others => '0');
+    variable tx_bit_cnt_q     : integer range 0 to 8 := 0;
+    variable tx_timer_q       : integer range 0 to 65535 := 0;
+    variable tx_sync_first_q  : std_logic := '0';
 
-  master_rising_event  <= '1' when (master_edge_event = '1' and xck_q = '0') else '0';
-  master_falling_event <= '1' when (master_edge_event = '1' and xck_q = '1') else '0';
+    variable tx_char_bits_q   : integer range 5 to 9 := 8;
+    variable tx_parity_en_q   : boolean := false;
+    variable tx_odd_q         : std_logic := '0';
+    variable tx_stop2_q       : std_logic := '0';
+    variable tx_parity_bit_q  : std_logic := '0';
 
-  slave_rising_event  <= '1' when (xck_sync(1) = '1' and xck_sync(2) = '0') else '0';
-  slave_falling_event <= '1' when (xck_sync(1) = '0' and xck_sync(2) = '1') else '0';
+    -------------------------------------------------------------------
+    -- Receiver state
+    -------------------------------------------------------------------
+    variable rx_state_q       : rx_state_t := RX_IDLE;
 
-  -- UCPOL = 0 : data changed on rising, sampled on falling
-  -- UCPOL = 1 : data changed on falling, sampled on rising
-  xck_change_event <= '1' when (UMSEL = '1' and
-    ((ddr_xck = '1' and
-      ((UCPOL = '0' and master_rising_event = '1') or
-       (UCPOL = '1' and master_falling_event = '1'))) or
-     (ddr_xck = '0' and
-      ((UCPOL = '0' and slave_rising_event = '1') or
-       (UCPOL = '1' and slave_falling_event = '1'))))) else '0';
+    variable rx_meta_q        : std_logic := '0';
+    variable rx_sync_q        : std_logic := '0';
+    variable rx_sync_d_q      : std_logic := '0';
 
-  xck_sample_event <= '1' when (UMSEL = '1' and
-    ((ddr_xck = '1' and
-      ((UCPOL = '0' and master_falling_event = '1') or
-       (UCPOL = '1' and master_rising_event = '1'))) or
-     (ddr_xck = '0' and
-      ((UCPOL = '0' and slave_falling_event = '1') or
-       (UCPOL = '1' and slave_rising_event = '1'))))) else '0';
+    variable rx_shift_q       : std_logic_vector(8 downto 0) := (others => '0');
+    variable rx_bit_cnt_q     : integer range 0 to 8 := 0;
+    variable rx_s0_q          : std_logic := '0';
+    variable rx_s1_q          : std_logic := '0';
+    variable rx_pe_latched_q  : std_logic := '0';
 
-  -- ===================================================================
-  -- Register write / read process
-  -- ===================================================================
-  reg_proc : process (clk, reset)
+    variable rx_shift_full_q  : std_logic := '0';
+    variable rx_dor_pending_q : std_logic := '0';
+
+    variable rx_char_bits_q   : integer range 5 to 9 := 8;
+    variable rx_parity_en_q   : boolean := false;
+    variable rx_odd_q         : std_logic := '0';
+    variable rx_mpcm_q        : std_logic := '0';
+
+    variable rx_pending_data_q : std_logic_vector(8 downto 0) := (others => '0');
+    variable rx_pending_fe_q   : std_logic := '0';
+    variable rx_pending_dor_q  : std_logic := '0';
+    variable rx_pending_pe_q   : std_logic := '0';
+
+    -------------------------------------------------------------------
+    -- Asynchronous sample generator
+    -------------------------------------------------------------------
+    variable baud_cnt_q       : integer range 0 to 4095 := 0;
+    variable rx_sample_pos_q  : integer range 0 to 15 := 0;
+
+    -------------------------------------------------------------------
+    -- Receive FIFO
+    -------------------------------------------------------------------
+    variable fifo_q       : fifo_array_t;
+    variable fifo_wr_q    : integer range 0 to 1 := 0;
+    variable fifo_rd_q    : integer range 0 to 1 := 0;
+    variable fifo_cnt_q   : integer range 0 to 2 := 0;
+
+    variable rxc_q        : std_logic := '0';
+    variable head_data_q  : std_logic_vector(8 downto 0) := (others => '0');
+    variable head_fe_q    : std_logic := '0';
+    variable head_dor_q   : std_logic := '0';
+    variable head_pe_q    : std_logic := '0';
+    variable rxb8_q       : std_logic := '0';
+
+    -------------------------------------------------------------------
+    -- Synchronous clock state
+    -------------------------------------------------------------------
+    variable xck_meta_q    : std_logic := '0';
+    variable xck_sync_q    : std_logic := '0';
+    variable xck_sync_d_q  : std_logic := '0';
+
+    variable xck_q         : std_logic := '0';
+    variable xck_cnt_q     : integer range 0 to 4095 := 0;
+    variable xck_out_q     : std_logic := '0';
+    variable xck_oe_q      : std_logic := '0';
+
+    -------------------------------------------------------------------
+    -- Local per-cycle variables
+    -------------------------------------------------------------------
+    variable v_char_bits       : integer range 5 to 9;
+    variable v_parity_en       : boolean;
+    variable v_samples_per_bit : integer range 8 to 16;
+    variable v_sample_first    : integer range 0 to 15;
+    variable v_sample_center   : integer range 0 to 15;
+    variable v_sample_last     : integer range 0 to 15;
+    variable v_ubrr_val        : integer range 0 to 4095;
+
+    variable v_rxd             : std_logic;
+    variable v_rx_prev         : std_logic;
+
+    variable v_xck_sync        : std_logic;
+    variable v_xck_sync_prev   : std_logic;
+
+    variable v_slave_rising    : boolean;
+    variable v_slave_falling   : boolean;
+
+    variable v_master_run      : boolean;
+    variable v_master_edge     : boolean;
+    variable v_master_rising   : boolean;
+    variable v_master_falling  : boolean;
+
+    variable v_xck_change      : boolean;
+    variable v_xck_sample      : boolean;
+
+    variable v_xck_q_old       : std_logic;
+
+    variable v_fifo            : fifo_array_t;
+    variable v_wr              : integer range 0 to 1;
+    variable v_rd              : integer range 0 to 1;
+    variable v_cnt             : integer range 0 to 2;
+
+    variable v_prev_shared_next : boolean;
+
+    variable v_udr_write       : boolean;
+    variable v_udr_write_data  : std_logic_vector(7 downto 0);
+    variable v_txc_clear       : boolean;
+    variable v_ubrrl_write     : boolean;
+
+    variable v_tx_tick         : boolean;
+    variable v_period          : integer range 0 to 65536;
+
+    variable v_rx_enabled      : boolean;
+
+    variable v_rx_sample_tick  : boolean;
+    variable v_rx_counter_reset: boolean;
+
+    variable v_rx_state        : rx_state_t;
+    variable v_shift_full      : std_logic;
+    variable v_dor_pending     : std_logic;
+
+    variable v_complete        : boolean;
+    variable v_stop_err        : std_logic;
+    variable v_pe_err          : std_logic;
+    variable v_frame_type      : std_logic;
+    variable v_bit             : std_logic;
+    variable v_majority        : std_logic;
+    variable v_parity_expected : std_logic;
+    variable v_frame_accept    : boolean;
+
+    variable v_rxb8_read       : std_logic;
+    variable v_tx_oe           : std_logic;
+
   begin
+
+    -------------------------------------------------------------------
+    -- Asynchronous reset
+    -------------------------------------------------------------------
     if reset = '1' then
-      U2X    <= '0';
-      MPCM   <= '0';
 
-      RXCIE  <= '0';
-      TXCIE  <= '0';
-      UDRIE  <= '0';
-      RXEN   <= '0';
-      TXEN   <= '0';
-      UCSZ2  <= '0';
-      TXB8   <= '0';
+      u2x_q   := '0';
+      mpcm_q  := '0';
 
-      UMSEL  <= '0';
-      UPM1   <= '0';
-      UPM0   <= '0';
-      USBS   <= '0';
-      UCSZ1  <= '1';
-      UCSZ0  <= '1';
-      UCPOL  <= '0';
+      rxcie_q := '0';
+      txcie_q := '0';
+      udrie_q := '0';
+      rxen_q  := '0';
+      txen_q  := '0';
+      ucsz2_q := '0';
+      txb8_q  := '0';
 
-      UBRR   <= (others => '0');
+      umsel_q := '0';
+      upm1_q  := '0';
+      upm0_q  := '0';
+      usbs_q  := '0';
+      ucsz1_q := '1';
+      ucsz0_q := '1';
+      ucpol_q := '0';
 
-      dout   <= (others => '0');
+      ubrr_q := 0;
 
-      udr_write_pulse   <= '0';
-      udr_write_data    <= (others => '0');
-      txc_clear_pulse   <= '0';
-      ubrrl_write_pulse <= '0';
-      fifo_pop          <= '0';
-      prev_read_shared  <= '0';
+      prev_shared_q := false;
+      dout_q := (others => '0');
 
+      tx_state_q      := TX_IDLE;
+      tx_out_q        := '1';
+      txc_q           := '0';
+      udre_q          := '1';
+      tx_buf_full_q   := '0';
+      tx_buf_q        := (others => '0');
+      tx_shift_q      := (others => '0');
+      tx_bit_cnt_q    := 0;
+      tx_timer_q      := 0;
+      tx_sync_first_q := '0';
+
+      tx_char_bits_q  := 8;
+      tx_parity_en_q  := false;
+      tx_odd_q        := '0';
+      tx_stop2_q      := '0';
+      tx_parity_bit_q := '0';
+
+      rx_state_q       := RX_IDLE;
+      rx_meta_q        := '0';
+      rx_sync_q        := '0';
+      rx_sync_d_q      := '0';
+      rx_shift_q       := (others => '0');
+      rx_bit_cnt_q     := 0;
+      rx_s0_q          := '0';
+      rx_s1_q          := '0';
+      rx_pe_latched_q  := '0';
+      rx_shift_full_q  := '0';
+      rx_dor_pending_q := '0';
+
+      rx_char_bits_q   := 8;
+      rx_parity_en_q   := false;
+      rx_odd_q         := '0';
+      rx_mpcm_q        := '0';
+
+      rx_pending_data_q := (others => '0');
+      rx_pending_fe_q   := '0';
+      rx_pending_dor_q  := '0';
+      rx_pending_pe_q   := '0';
+
+      baud_cnt_q      := 0;
+      rx_sample_pos_q := 0;
+
+      fifo_wr_q  := 0;
+      fifo_rd_q  := 0;
+      fifo_cnt_q := 0;
+      rxc_q      := '0';
+
+      head_data_q := (others => '0');
+      head_fe_q   := '0';
+      head_dor_q  := '0';
+      head_pe_q   := '0';
+      rxb8_q      := '0';
+
+      for i in 0 to 1 loop
+        fifo_q(i).data := (others => '0');
+        fifo_q(i).fe   := '0';
+        fifo_q(i).dor  := '0';
+        fifo_q(i).pe   := '0';
+      end loop;
+
+      xck_meta_q   := '0';
+      xck_sync_q   := '0';
+      xck_sync_d_q := '0';
+      xck_q        := '0';
+      xck_cnt_q    := 0;
+      xck_out_q    := '0';
+      xck_oe_q     := '0';
+
+    -------------------------------------------------------------------
+    -- Clock edge
+    -------------------------------------------------------------------
     elsif rising_edge(clk) then
-      -- Default one-cycle pulses
-      udr_write_pulse   <= '0';
-      txc_clear_pulse   <= '0';
-      ubrrl_write_pulse <= '0';
-      fifo_pop          <= '0';
 
-      -- Default: previous-cycle shared-read flag cleared unless this cycle
-      -- is another shared read.
-      prev_read_shared  <= '0';
+      -----------------------------------------------------------------
+      -- Capture old synchronized inputs for edge/data usage
+      -----------------------------------------------------------------
+      v_rxd           := rx_sync_q;
+      v_rx_prev       := rx_sync_d_q;
+      v_xck_sync      := xck_sync_q;
+      v_xck_sync_prev := xck_sync_d_q;
 
-      ---------------------------------------------------------------
-      -- Write accesses
-      ---------------------------------------------------------------
-      if we = '1' then
+      -----------------------------------------------------------------
+      -- Update input synchronizers
+      -----------------------------------------------------------------
+      rx_sync_d_q := rx_sync_q;
+      rx_sync_q   := rx_meta_q;
+      rx_meta_q   := rx_in;
+
+      xck_sync_d_q := xck_sync_q;
+      xck_sync_q   := xck_meta_q;
+      xck_meta_q   := xck_in;
+
+      -----------------------------------------------------------------
+      -- Local FIFO working copies
+      -----------------------------------------------------------------
+      v_fifo := fifo_q;
+      v_wr   := fifo_wr_q;
+      v_rd   := fifo_rd_q;
+      v_cnt  := fifo_cnt_q;
+
+      v_prev_shared_next := false;
+
+      -----------------------------------------------------------------
+      -- Read accesses
+      -----------------------------------------------------------------
+      if re = '1' then
         case addr is
+
           when ADDR_UDR =>
-            -- UDR write is accepted only when transmitter enabled and UDRE set.
-            if TXEN = '1' and udre_i = '1' then
-              udr_write_pulse <= '1';
-              udr_write_data  <= din;
+            if v_cnt > 0 then
+              dout_q := v_fifo(v_rd).data(7 downto 0);
+
+              v_fifo(v_rd).data := (others => '0');
+              v_fifo(v_rd).fe   := '0';
+              v_fifo(v_rd).dor  := '0';
+              v_fifo(v_rd).pe   := '0';
+
+              if v_rd = 0 then
+                v_rd := 1;
+              else
+                v_rd := 0;
+              end if;
+
+              v_cnt := v_cnt - 1;
+            else
+              dout_q := (others => '0');
             end if;
 
           when ADDR_UCSRA =>
-            -- U2X and MPCM are writable.
-            -- TXC is cleared by writing a '1' to bit 6.
-            U2X  <= din(1);
-            MPCM <= din(0);
-            if din(6) = '1' then
-              txc_clear_pulse <= '1';
+            if v_cnt > 0 then
+              dout_q := '1' & txc_q & udre_q &
+                        v_fifo(v_rd).fe & v_fifo(v_rd).dor & v_fifo(v_rd).pe &
+                        u2x_q & mpcm_q;
+            else
+              dout_q := '0' & txc_q & udre_q &
+                        '0' & '0' & '0' &
+                        u2x_q & mpcm_q;
             end if;
 
           when ADDR_UCSRB =>
-            RXCIE <= din(7);
-            TXCIE <= din(6);
-            UDRIE <= din(5);
-            RXEN  <= din(4);
-            TXEN  <= din(3);
-            UCSZ2 <= din(2);
-            -- RXB8 is read-only; ignore din(1)
-            TXB8  <= din(0);
+            v_rxb8_read := '0';
+            if v_cnt > 0 then
+              v_rxb8_read := v_fifo(v_rd).data(8);
+            end if;
+
+            dout_q := rxcie_q & txcie_q & udrie_q &
+                      rxen_q & txen_q & ucsz2_q &
+                      v_rxb8_read & txb8_q;
+
+          when ADDR_SHARED =>
+            if prev_shared_q then
+              dout_q := '1' & umsel_q & upm1_q & upm0_q &
+                        usbs_q & ucsz1_q & ucsz0_q & ucpol_q;
+            else
+              dout_q := "0000" & int_to_slv4(ubrr_q / 256);
+            end if;
+            v_prev_shared_next := true;
+
+          when ADDR_UBRRL =>
+            dout_q := int_to_slv8(ubrr_q mod 256);
+
+          when others =>
+            dout_q := (others => '0');
+
+        end case;
+      end if;
+
+      -----------------------------------------------------------------
+      -- Write accesses
+      -----------------------------------------------------------------
+      v_udr_write      := false;
+      v_udr_write_data := (others => '0');
+      v_txc_clear      := false;
+      v_ubrrl_write    := false;
+
+      if we = '1' then
+        case addr is
+
+          when ADDR_UDR =>
+            if txen_q = '1' and udre_q = '1' then
+              v_udr_write      := true;
+              v_udr_write_data := din;
+            end if;
+
+          when ADDR_UCSRA =>
+            u2x_q  := din(1);
+            mpcm_q := din(0);
+
+            if din(6) = '1' then
+              v_txc_clear := true;
+            end if;
+
+          when ADDR_UCSRB =>
+            rxcie_q := din(7);
+            txcie_q := din(6);
+            udrie_q := din(5);
+            rxen_q  := din(4);
+            txen_q  := din(3);
+            ucsz2_q := din(2);
+            txb8_q  := din(0);
 
           when ADDR_SHARED =>
             if din(7) = '1' then
-              -- URSEL = 1: write UCSRC
-              UMSEL <= din(6);
-              UPM1  <= din(5);
-              UPM0  <= din(4);
-              USBS  <= din(3);
-              UCSZ1 <= din(2);
-              UCSZ0 <= din(1);
-              UCPOL <= din(0);
+              umsel_q := din(6);
+              upm1_q  := din(5);
+              upm0_q  := din(4);
+              usbs_q  := din(3);
+              ucsz1_q := din(2);
+              ucsz0_q := din(1);
+              ucpol_q := din(0);
             else
-              -- URSEL = 0: write UBRRH
-              UBRR(11 downto 8) <= unsigned(din(3 downto 0));
+              ubrr_q := slv_to_int(din(3 downto 0)) * 256 + (ubrr_q mod 256);
             end if;
 
           when ADDR_UBRRL =>
-            UBRR(7 downto 0) <= unsigned(din);
-            ubrrl_write_pulse <= '1';
+            ubrr_q         := (ubrr_q / 256) * 256 + slv_to_int(din);
+            v_ubrrl_write  := true;
 
           when others =>
             null;
+
         end case;
       end if;
 
-      ---------------------------------------------------------------
-      -- Read accesses
-      ---------------------------------------------------------------
-      if re = '1' then
-        case addr is
-          when ADDR_UDR =>
-            if fifo_empty_i = '0' then
-              fifo_pop <= '1';
-              dout     <= head_data(7 downto 0);
+      prev_shared_q := v_prev_shared_next;
+
+      -----------------------------------------------------------------
+      -- Derived frame / baud configuration
+      -----------------------------------------------------------------
+      if ucsz2_q = '0' and ucsz1_q = '0' and ucsz0_q = '0' then
+        v_char_bits := 5;
+      elsif ucsz2_q = '0' and ucsz1_q = '0' and ucsz0_q = '1' then
+        v_char_bits := 6;
+      elsif ucsz2_q = '0' and ucsz1_q = '1' and ucsz0_q = '0' then
+        v_char_bits := 7;
+      elsif ucsz2_q = '0' and ucsz1_q = '1' and ucsz0_q = '1' then
+        v_char_bits := 8;
+      elsif ucsz2_q = '1' and ucsz1_q = '1' and ucsz0_q = '1' then
+        v_char_bits := 9;
+      else
+        v_char_bits := 8;
+      end if;
+
+      v_parity_en := (upm1_q = '1');
+
+      if u2x_q = '1' and umsel_q = '0' then
+        v_samples_per_bit := 8;
+      else
+        v_samples_per_bit := 16;
+      end if;
+
+      if v_samples_per_bit = 8 then
+        v_sample_first  := 3;
+        v_sample_center := 4;
+        v_sample_last   := 5;
+      else
+        v_sample_first  := 7;
+        v_sample_center := 8;
+        v_sample_last   := 9;
+      end if;
+
+      v_ubrr_val := ubrr_q;
+
+      -----------------------------------------------------------------
+      -- Receiver disabled: immediate flush and state clear
+      -----------------------------------------------------------------
+      if rxen_q = '0' then
+        v_rx_enabled := false;
+
+        rx_state_q       := RX_IDLE;
+        rx_shift_full_q  := '0';
+        rx_dor_pending_q := '0';
+        rx_pe_latched_q  := '0';
+        rx_s0_q          := '0';
+        rx_s1_q          := '0';
+        rx_shift_q       := (others => '0');
+        rx_bit_cnt_q     := 0;
+
+        rx_char_bits_q := 8;
+        rx_parity_en_q := false;
+        rx_odd_q       := '0';
+        rx_mpcm_q      := '0';
+
+        rx_pending_data_q := (others => '0');
+        rx_pending_fe_q   := '0';
+        rx_pending_dor_q  := '0';
+        rx_pending_pe_q   := '0';
+
+        baud_cnt_q      := 0;
+        rx_sample_pos_q := 0;
+
+        fifo_wr_q := 0;
+        fifo_rd_q := 0;
+        fifo_cnt_q := 0;
+        rxc_q      := '0';
+
+        head_data_q := (others => '0');
+        head_fe_q   := '0';
+        head_dor_q  := '0';
+        head_pe_q   := '0';
+        rxb8_q      := '0';
+
+        for i in 0 to 1 loop
+          fifo_q(i).data := (others => '0');
+          fifo_q(i).fe   := '0';
+          fifo_q(i).dor  := '0';
+          fifo_q(i).pe   := '0';
+        end loop;
+
+      else
+        v_rx_enabled := true;
+      end if;
+
+      -----------------------------------------------------------------
+      -- Synchronous clock generation / edge detection
+      -----------------------------------------------------------------
+      v_slave_rising  := (v_xck_sync = '1' and v_xck_sync_prev = '0');
+      v_slave_falling := (v_xck_sync = '0' and v_xck_sync_prev = '1');
+
+      v_master_run := (umsel_q = '1' and ddr_xck = '1' and
+                       (txen_q = '1' or rxen_q = '1' or
+                        tx_state_q /= TX_IDLE or
+                        tx_buf_full_q = '1' or
+                        rx_state_q /= RX_IDLE));
+
+      v_master_edge    := false;
+      v_master_rising  := false;
+      v_master_falling := false;
+
+      xck_oe_q := '0';
+
+      if umsel_q = '1' and ddr_xck = '1' then
+        xck_oe_q := '1';
+
+        if v_master_run then
+
+          if v_ubrrl_write then
+            xck_cnt_q := 0;
+          end if;
+
+          v_xck_q_old := xck_q;
+
+          if xck_cnt_q >= v_ubrr_val then
+            v_master_edge := true;
+
+            if v_xck_q_old = '0' then
+              v_master_rising := true;
             else
-              dout <= (others => '0');
+              v_master_falling := true;
             end if;
 
-          when ADDR_UCSRA =>
-            dout <= rxc_i & txc_i & udre_i &
-                    head_fe & head_dor & head_pe &
-                    U2X & MPCM;
+            xck_q     := not v_xck_q_old;
+            xck_out_q := not v_xck_q_old;
+            xck_cnt_q := 0;
+          else
+            xck_out_q := xck_q;
+            xck_cnt_q := xck_cnt_q + 1;
+          end if;
 
-          when ADDR_UCSRB =>
-            dout <= RXCIE & TXCIE & UDRIE &
-                    RXEN & TXEN & UCSZ2 &
-                    rxb8_i & TXB8;
-
-          when ADDR_SHARED =>
-            if prev_read_shared = '1' then
-              -- Second consecutive read returns UCSRC, with URSEL read as 1.
-              dout <= '1' & UMSEL & UPM1 & UPM0 & USBS & UCSZ1 & UCSZ0 & UCPOL;
-            else
-              -- First read returns UBRRH, with URSEL read as 0.
-              dout <= "0000" & std_logic_vector(UBRR(11 downto 8));
-            end if;
-            prev_read_shared <= '1';
-
-          when ADDR_UBRRL =>
-            dout <= std_logic_vector(UBRR(7 downto 0));
-
-          when others =>
-            dout <= (others => '0');
-        end case;
-      end if;
-    end if;
-  end process reg_proc;
-
-  -- ===================================================================
-  -- Transmitter process
-  -- ===================================================================
-  tx_proc : process (clk, reset)
-    variable v_tick   : boolean;
-    variable v_period : integer;
-  begin
-    if reset = '1' then
-      tx_state       <= TX_IDLE;
-      tx_out         <= '1';
-      txc_i          <= '0';
-      udre_i         <= '1';
-      tx_buf_full    <= '0';
-      tx_buf         <= (others => '0');
-      tx_shift       <= (others => '0');
-      tx_bit_cnt     <= 0;
-      tx_timer       <= 0;
-      tx_sync_first  <= '0';
-
-      tx_char_bits_l <= 8;
-      tx_parity_en_l <= false;
-      tx_odd_l       <= '0';
-      tx_stop2_l     <= '0';
-      tx_parity_bit  <= '0';
-
-    elsif rising_edge(clk) then
-      -----------------------------------------------------------------
-      -- TXC clear:
-      --   * write-one-to-clear via UCSRA
-      --   * interrupt acknowledge
-      -----------------------------------------------------------------
-      if txc_clear_pulse = '1' or tx_irq_ack = '1' then
-        txc_i <= '0';
-      end if;
-
-      -----------------------------------------------------------------
-      -- Load transmit buffer from UDR write
-      -----------------------------------------------------------------
-      if udr_write_pulse = '1' and TXEN = '1' and tx_buf_full = '0' then
-        tx_buf      <= TXB8 & udr_write_data;
-        tx_buf_full <= '1';
-        udre_i      <= '0';
-      end if;
-
-      -----------------------------------------------------------------
-      -- Asynchronous bit timer
-      -----------------------------------------------------------------
-      v_tick := false;
-
-      if UMSEL = '0' and tx_state /= TX_IDLE then
-        v_period := (ubrr_val + 1) * samples_per_bit;
-        if tx_timer >= v_period - 1 then
-          tx_timer <= 0;
-          v_tick   := true;
         else
-          tx_timer <= tx_timer + 1;
+          xck_cnt_q := 0;
+
+          if ucpol_q = '1' then
+            xck_q     := '1';
+            xck_out_q := '1';
+          else
+            xck_q     := '0';
+            xck_out_q := '0';
+          end if;
+        end if;
+
+      else
+        xck_oe_q  := '0';
+        xck_out_q := '0';
+        xck_cnt_q := 0;
+
+        if ucpol_q = '1' then
+          xck_q := '1';
+        else
+          xck_q := '0';
+        end if;
+      end if;
+
+      v_xck_change := false;
+      v_xck_sample := false;
+
+      if umsel_q = '1' then
+        if ddr_xck = '1' then
+          if v_master_edge then
+            if ucpol_q = '0' then
+              if v_master_rising then
+                v_xck_change := true;
+              elsif v_master_falling then
+                v_xck_sample := true;
+              end if;
+            else
+              if v_master_falling then
+                v_xck_change := true;
+              elsif v_master_rising then
+                v_xck_sample := true;
+              end if;
+            end if;
+          end if;
+        else
+          if ucpol_q = '0' then
+            if v_slave_rising then
+              v_xck_change := true;
+            elsif v_slave_falling then
+              v_xck_sample := true;
+            end if;
+          else
+            if v_slave_falling then
+              v_xck_change := true;
+            elsif v_slave_rising then
+              v_xck_sample := true;
+            end if;
+          end if;
+        end if;
+      end if;
+
+      -----------------------------------------------------------------
+      -- TXC clear sources
+      -----------------------------------------------------------------
+      if v_txc_clear or tx_irq_ack = '1' then
+        txc_q := '0';
+      end if;
+
+      -----------------------------------------------------------------
+      -- Accept UDR write into transmit buffer
+      -----------------------------------------------------------------
+      if v_udr_write and txen_q = '1' and tx_buf_full_q = '0' then
+        tx_buf_q      := txb8_q & v_udr_write_data;
+        tx_buf_full_q := '1';
+        udre_q        := '0';
+      end if;
+
+      -----------------------------------------------------------------
+      -- Asynchronous transmitter bit timer
+      -----------------------------------------------------------------
+      v_tx_tick := false;
+
+      if umsel_q = '0' and tx_state_q /= TX_IDLE then
+        v_period := (v_ubrr_val + 1) * v_samples_per_bit;
+
+        if tx_timer_q >= v_period - 1 then
+          tx_timer_q := 0;
+          v_tx_tick  := true;
+        else
+          tx_timer_q := tx_timer_q + 1;
         end if;
       else
-        tx_timer <= 0;
+        tx_timer_q := 0;
       end if;
 
       -----------------------------------------------------------------
       -- Transmit state machine
-      -- Async advances on local bit tick.
-      -- Sync advances on XCK change edge.
       -----------------------------------------------------------------
-      if (UMSEL = '0' and v_tick) or
-         (UMSEL = '1' and xck_change_event = '1') then
+      if (umsel_q = '0' and v_tx_tick) or
+         (umsel_q = '1' and v_xck_change) then
 
-        case tx_state is
+        case tx_state_q is
+
           when TX_IDLE =>
             null;
 
           when TX_START =>
-            if UMSEL = '1' then
-              -- Synchronous mode:
-              -- First change edge drives start bit low.
-              -- Second change edge begins data bit 0.
-              if tx_sync_first = '1' then
-                tx_out        <= '0';
-                tx_sync_first <= '0';
+            if umsel_q = '1' then
+              if tx_sync_first_q = '1' then
+                tx_out_q        := '0';
+                tx_sync_first_q := '0';
               else
-                tx_out     <= tx_shift(0);
-                tx_bit_cnt <= 0;
-                tx_state   <= TX_DATA;
+                tx_out_q     := tx_shift_q(0);
+                tx_bit_cnt_q := 0;
+                tx_state_q   := TX_DATA;
               end if;
             else
-              -- Asynchronous mode:
-              -- Start bit has finished; output data bit 0.
-              tx_out     <= tx_shift(0);
-              tx_bit_cnt <= 0;
-              tx_state   <= TX_DATA;
+              tx_out_q     := tx_shift_q(0);
+              tx_bit_cnt_q := 0;
+              tx_state_q   := TX_DATA;
             end if;
 
           when TX_DATA =>
-            if tx_bit_cnt = tx_char_bits_l - 1 then
-              if tx_parity_en_l then
-                tx_out   <= tx_parity_bit;
-                tx_state <= TX_PARITY;
+            if tx_bit_cnt_q = tx_char_bits_q - 1 then
+              if tx_parity_en_q then
+                tx_out_q   := tx_parity_bit_q;
+                tx_state_q := TX_PARITY;
               else
-                tx_out   <= '1';
-                tx_state <= TX_STOP1;
+                tx_out_q   := '1';
+                tx_state_q := TX_STOP1;
               end if;
             else
-              tx_bit_cnt <= tx_bit_cnt + 1;
-              tx_out     <= tx_shift(tx_bit_cnt + 1);
+              tx_bit_cnt_q := tx_bit_cnt_q + 1;
+              tx_out_q     := tx_shift_q(tx_bit_cnt_q + 1);
             end if;
 
           when TX_PARITY =>
-            tx_out   <= '1';
-            tx_state <= TX_STOP1;
+            tx_out_q   := '1';
+            tx_state_q := TX_STOP1;
 
           when TX_STOP1 =>
-            if tx_stop2_l = '1' then
-              tx_out   <= '1';
-              tx_state <= TX_STOP2;
+            if tx_stop2_q = '1' then
+              tx_out_q   := '1';
+              tx_state_q := TX_STOP2;
             else
-              -- Frame complete after first stop bit.
-              if tx_buf_full = '1' then
-                -- Back-to-back frame: load next frame immediately.
-                tx_shift       <= tx_buf;
-                tx_buf_full    <= '0';
-                udre_i         <= '1';
-                tx_bit_cnt     <= 0;
-                tx_char_bits_l <= char_bits;
-                tx_parity_en_l <= parity_en;
-                tx_odd_l       <= UPM0;
-                tx_stop2_l     <= USBS;
+              if tx_buf_full_q = '1' then
+                -- Back-to-back frame: start immediately, no sync gap.
+                tx_shift_q     := tx_buf_q;
+                tx_buf_full_q  := '0';
+                udre_q         := '1';
+                tx_bit_cnt_q   := 0;
+                tx_char_bits_q := v_char_bits;
+                tx_parity_en_q := v_parity_en;
+                tx_odd_q       := upm0_q;
+                tx_stop2_q     := usbs_q;
 
-                if UPM0 = '0' then
-                  tx_parity_bit <= parity_even(tx_buf, char_bits);
+                if upm0_q = '0' then
+                  tx_parity_bit_q := parity_even(tx_buf_q, v_char_bits);
                 else
-                  tx_parity_bit <= parity_odd(tx_buf, char_bits);
+                  tx_parity_bit_q := parity_odd(tx_buf_q, v_char_bits);
                 end if;
 
-                if UMSEL = '1' then
-                  tx_out        <= '1';
-                  tx_sync_first <= '1';
-                else
-                  tx_out        <= '0';
-                  tx_sync_first <= '0';
-                end if;
-
-                tx_state <= TX_START;
-                tx_timer <= 0;
+                tx_out_q        := '0';
+                tx_sync_first_q := '0';
+                tx_state_q      := TX_START;
+                tx_timer_q      := 0;
               else
-                tx_state <= TX_IDLE;
-                tx_out   <= '1';
-                txc_i    <= '1';
+                tx_state_q := TX_IDLE;
+                tx_out_q   := '1';
+                txc_q      := '1';
               end if;
             end if;
 
           when TX_STOP2 =>
-            -- Frame complete after second stop bit.
-            if tx_buf_full = '1' then
-              tx_shift       <= tx_buf;
-              tx_buf_full    <= '0';
-              udre_i         <= '1';
-              tx_bit_cnt     <= 0;
-              tx_char_bits_l <= char_bits;
-              tx_parity_en_l <= parity_en;
-              tx_odd_l       <= UPM0;
-              tx_stop2_l     <= USBS;
+            if tx_buf_full_q = '1' then
+              -- Back-to-back frame: start immediately, no sync gap.
+              tx_shift_q     := tx_buf_q;
+              tx_buf_full_q  := '0';
+              udre_q         := '1';
+              tx_bit_cnt_q   := 0;
+              tx_char_bits_q := v_char_bits;
+              tx_parity_en_q := v_parity_en;
+              tx_odd_q       := upm0_q;
+              tx_stop2_q     := usbs_q;
 
-              if UPM0 = '0' then
-                tx_parity_bit <= parity_even(tx_buf, char_bits);
+              if upm0_q = '0' then
+                tx_parity_bit_q := parity_even(tx_buf_q, v_char_bits);
               else
-                tx_parity_bit <= parity_odd(tx_buf, char_bits);
+                tx_parity_bit_q := parity_odd(tx_buf_q, v_char_bits);
               end if;
 
-              if UMSEL = '1' then
-                tx_out        <= '1';
-                tx_sync_first <= '1';
-              else
-                tx_out        <= '0';
-                tx_sync_first <= '0';
-              end if;
-
-              tx_state <= TX_START;
-              tx_timer <= 0;
+              tx_out_q        := '0';
+              tx_sync_first_q := '0';
+              tx_state_q      := TX_START;
+              tx_timer_q      := 0;
             else
-              tx_state <= TX_IDLE;
-              tx_out   <= '1';
-              txc_i    <= '1';
+              tx_state_q := TX_IDLE;
+              tx_out_q   := '1';
+              txc_q      := '1';
             end if;
 
           when others =>
-            tx_state <= TX_IDLE;
+            tx_state_q := TX_IDLE;
+
         end case;
       end if;
 
       -----------------------------------------------------------------
-      -- Start a new frame when idle and buffer is full.
-      -- This also handles pending transmission after TXEN is cleared.
+      -- Start a new frame when idle and buffer is full
       -----------------------------------------------------------------
-      if tx_state = TX_IDLE and tx_buf_full = '1' then
-        tx_shift       <= tx_buf;
-        tx_buf_full    <= '0';
-        udre_i         <= '1';
-        tx_bit_cnt     <= 0;
-        tx_char_bits_l <= char_bits;
-        tx_parity_en_l <= parity_en;
-        tx_odd_l       <= UPM0;
-        tx_stop2_l     <= USBS;
+      if tx_state_q = TX_IDLE and tx_buf_full_q = '1' then
+        tx_shift_q     := tx_buf_q;
+        tx_buf_full_q  := '0';
+        udre_q         := '1';
+        tx_bit_cnt_q   := 0;
+        tx_char_bits_q := v_char_bits;
+        tx_parity_en_q := v_parity_en;
+        tx_odd_q       := upm0_q;
+        tx_stop2_q     := usbs_q;
 
-        if UPM0 = '0' then
-          tx_parity_bit <= parity_even(tx_buf, char_bits);
+        if upm0_q = '0' then
+          tx_parity_bit_q := parity_even(tx_buf_q, v_char_bits);
         else
-          tx_parity_bit <= parity_odd(tx_buf, char_bits);
+          tx_parity_bit_q := parity_odd(tx_buf_q, v_char_bits);
         end if;
 
-        if UMSEL = '1' then
-          tx_out        <= '1';
-          tx_sync_first <= '1';
+        if umsel_q = '1' then
+          tx_out_q        := '1';
+          tx_sync_first_q := '1';
         else
-          tx_out        <= '0';
-          tx_sync_first <= '0';
+          tx_out_q        := '0';
+          tx_sync_first_q := '0';
         end if;
 
-        tx_state <= TX_START;
-        tx_timer <= 0;
+        tx_state_q := TX_START;
+        tx_timer_q := 0;
       end if;
 
       -----------------------------------------------------------------
       -- Idle line high when truly idle
       -----------------------------------------------------------------
-      if tx_state = TX_IDLE and tx_buf_full = '0' then
-        tx_out <= '1';
+      if tx_state_q = TX_IDLE and tx_buf_full_q = '0' then
+        tx_out_q := '1';
       end if;
-    end if;
-  end process tx_proc;
-
-  -- ===================================================================
-  -- Receiver process
-  -- ===================================================================
-  rx_proc : process (clk, reset)
-    variable v_state        : rx_state_t;
-    variable v_shift_full   : std_logic;
-    variable v_dor_pending  : std_logic;
-
-    variable v_push         : boolean;
-    variable v_data         : std_logic_vector(8 downto 0);
-    variable v_fe           : std_logic;
-    variable v_dor          : std_logic;
-    variable v_pe           : std_logic;
-
-    variable v_complete     : boolean;
-    variable v_stop_err     : std_logic;
-    variable v_pe_err       : std_logic;
-    variable v_frame_type   : std_logic;
-
-    variable rxd_v          : std_logic;
-    variable prev_v         : std_logic;
-
-    variable majority_v     : std_logic;
-    variable bit_v          : std_logic;
-    variable parity_expected_v : std_logic;
-  begin
-    if reset = '1' then
-      rx_state        <= RX_IDLE;
-      rx_sync         <= (others => '0');
-      rx_shift        <= (others => '0');
-      rx_bit_cnt      <= 0;
-      rx_s0           <= '0';
-      rx_s1           <= '0';
-      rx_pe_latched   <= '0';
-
-      rx_shift_full   <= '0';
-      rx_dor_pending  <= '0';
-
-      rx_char_bits_l  <= 8;
-      rx_parity_en_l  <= false;
-      rx_odd_l        <= '0';
-      rx_mpcm_l       <= '0';
-
-      rx_pending_data <= (others => '0');
-      rx_pending_fe   <= '0';
-      rx_pending_dor  <= '0';
-      rx_pending_pe   <= '0';
-
-      rx_start_reset  <= '0';
-
-      fifo_push       <= '0';
-      fifo_push_data  <= (others => '0');
-      fifo_push_fe    <= '0';
-      fifo_push_dor   <= '0';
-      fifo_push_pe    <= '0';
-
-    elsif rising_edge(clk) then
-      -- Default one-cycle strobes
-      fifo_push      <= '0';
-      rx_start_reset <= '0';
-
-      -- Synchronize RX input.
-      -- After this update:
-      --   rx_sync(0) = newest metastability stage
-      --   rx_sync(1) = synchronized data
-      --   rx_sync(2) = previous synchronized data
-      rx_sync <= rx_sync(1 downto 0) & rx_in;
-
-      rxd_v  := rx_sync(1);
-      prev_v := rx_sync(2);
-
-      -- Local working copies to avoid stale-signal issues within this cycle.
-      v_state       := rx_state;
-      v_shift_full  := rx_shift_full;
-      v_dor_pending := rx_dor_pending;
-
-      v_push        := false;
-      v_data        := (others => '0');
-      v_fe          := '0';
-      v_dor         := '0';
-      v_pe          := '0';
-
-      v_complete    := false;
-      v_stop_err    := '0';
-      v_pe_err      := '0';
-      v_frame_type  := '0';
-
-      majority_v    := '0';
-      bit_v         := '0';
-      parity_expected_v := '0';
 
       -----------------------------------------------------------------
-      -- Receiver disabled: immediate flush and state clear.
-      -- FIFO flush itself is handled in the FIFO process.
+      -- Receiver enabled path
       -----------------------------------------------------------------
-      if RXEN = '0' then
-        v_state       := RX_IDLE;
-        v_shift_full  := '0';
-        v_dor_pending := '0';
-        fifo_push     <= '0';
+      if v_rx_enabled then
 
-      else
-        ---------------------------------------------------------------
-        -- If a completed frame is waiting in the shift register and
-        -- FIFO space exists, move it into the FIFO.
-        ---------------------------------------------------------------
-        if v_shift_full = '1' and fifo_full_i = '0' then
-          v_push := true;
-          v_data := rx_pending_data;
-          v_fe   := rx_pending_fe;
-          v_dor  := rx_pending_dor;
-          v_pe   := rx_pending_pe;
+        -----------------------------------------------------------------
+        -- Asynchronous sample tick generator
+        -----------------------------------------------------------------
+        v_rx_sample_tick   := false;
+        v_rx_counter_reset := false;
+
+        if umsel_q = '0' and not v_ubrrl_write then
+          if baud_cnt_q >= v_ubrr_val then
+            v_rx_sample_tick := true;
+            baud_cnt_q       := 0;
+
+            if rx_sample_pos_q >= v_samples_per_bit - 1 then
+              rx_sample_pos_q := 0;
+            else
+              rx_sample_pos_q := rx_sample_pos_q + 1;
+            end if;
+          else
+            baud_cnt_q := baud_cnt_q + 1;
+          end if;
+        else
+          baud_cnt_q      := 0;
+          rx_sample_pos_q := 0;
+        end if;
+
+        -----------------------------------------------------------------
+        -- Receiver local working copies
+        -----------------------------------------------------------------
+        v_rx_state     := rx_state_q;
+        v_shift_full   := rx_shift_full_q;
+        v_dor_pending  := rx_dor_pending_q;
+
+        v_complete     := false;
+        v_stop_err     := '0';
+        v_pe_err       := '0';
+        v_frame_type   := '0';
+        v_bit          := '0';
+        v_majority     := '0';
+
+        -----------------------------------------------------------------
+        -- Move pending shift-register frame into FIFO if space exists
+        -----------------------------------------------------------------
+        if v_shift_full = '1' and v_cnt < 2 then
+          v_fifo(v_wr).data := rx_pending_data_q;
+          v_fifo(v_wr).fe   := rx_pending_fe_q;
+          v_fifo(v_wr).dor  := rx_pending_dor_q or v_dor_pending;
+          v_fifo(v_wr).pe   := rx_pending_pe_q;
+
+          if v_wr = 0 then
+            v_wr := 1;
+          else
+            v_wr := 0;
+          end if;
+
+          v_cnt := v_cnt + 1;
 
           v_shift_full  := '0';
           v_dor_pending := '0';
         end if;
 
-        ---------------------------------------------------------------
-        -- Asynchronous receiver
-        ---------------------------------------------------------------
-        if UMSEL = '0' then
+        -----------------------------------------------------------------
+        -- Asynchronous or synchronous receiver state machine
+        -----------------------------------------------------------------
+        if umsel_q = '0' then
 
-          -- Sample-tick state machine
-          if rx_sample_tick = '1' then
-            case v_state is
+          if v_rx_sample_tick then
+            case v_rx_state is
+
               when RX_IDLE =>
                 null;
 
               when RX_START =>
-                if rx_sample_pos = sample_first_idx then
-                  rx_s0 <= rxd_v;
-                elsif rx_sample_pos = sample_center_idx then
-                  rx_s1 <= rxd_v;
-                elsif rx_sample_pos = sample_last_idx then
-                  majority_v := (rx_s0 and rx_s1) or
-                                (rx_s0 and rxd_v) or
-                                (rx_s1 and rxd_v);
+                if rx_sample_pos_q = v_sample_first then
+                  rx_s0_q := v_rxd;
+                elsif rx_sample_pos_q = v_sample_center then
+                  rx_s1_q := v_rxd;
+                elsif rx_sample_pos_q = v_sample_last then
+                  v_majority := (rx_s0_q and rx_s1_q) or
+                                (rx_s0_q and v_rxd) or
+                                (rx_s1_q and v_rxd);
 
-                  if majority_v = '1' then
-                    -- False start bit / noise spike: reject.
-                    v_state := RX_IDLE;
+                  if v_majority = '1' then
+                    v_rx_state := RX_IDLE;
                   else
-                    -- Valid start bit.
-                    v_state    := RX_DATA;
-                    rx_bit_cnt <= 0;
+                    v_rx_state   := RX_DATA;
+                    rx_bit_cnt_q := 0;
                   end if;
                 end if;
 
               when RX_DATA =>
-                if rx_sample_pos = sample_first_idx then
-                  rx_s0 <= rxd_v;
-                elsif rx_sample_pos = sample_center_idx then
-                  rx_s1 <= rxd_v;
-                elsif rx_sample_pos = sample_last_idx then
-                  bit_v := (rx_s0 and rx_s1) or
-                           (rx_s0 and rxd_v) or
-                           (rx_s1 and rxd_v);
+                if rx_sample_pos_q = v_sample_first then
+                  rx_s0_q := v_rxd;
+                elsif rx_sample_pos_q = v_sample_center then
+                  rx_s1_q := v_rxd;
+                elsif rx_sample_pos_q = v_sample_last then
+                  v_bit := (rx_s0_q and rx_s1_q) or
+                           (rx_s0_q and v_rxd) or
+                           (rx_s1_q and v_rxd);
 
-                  rx_shift(rx_bit_cnt) <= bit_v;
+                  rx_shift_q(rx_bit_cnt_q) := v_bit;
 
-                  if rx_bit_cnt = rx_char_bits_l - 1 then
-                    if rx_parity_en_l then
-                      v_state := RX_PARITY;
+                  if rx_bit_cnt_q = rx_char_bits_q - 1 then
+                    if rx_parity_en_q then
+                      v_rx_state := RX_PARITY;
                     else
-                      v_state := RX_STOP;
+                      v_rx_state := RX_STOP;
                     end if;
                   else
-                    rx_bit_cnt <= rx_bit_cnt + 1;
+                    rx_bit_cnt_q := rx_bit_cnt_q + 1;
                   end if;
                 end if;
 
               when RX_PARITY =>
-                if rx_sample_pos = sample_first_idx then
-                  rx_s0 <= rxd_v;
-                elsif rx_sample_pos = sample_center_idx then
-                  rx_s1 <= rxd_v;
-                elsif rx_sample_pos = sample_last_idx then
-                  bit_v := (rx_s0 and rx_s1) or
-                           (rx_s0 and rxd_v) or
-                           (rx_s1 and rxd_v);
+                if rx_sample_pos_q = v_sample_first then
+                  rx_s0_q := v_rxd;
+                elsif rx_sample_pos_q = v_sample_center then
+                  rx_s1_q := v_rxd;
+                elsif rx_sample_pos_q = v_sample_last then
+                  v_bit := (rx_s0_q and rx_s1_q) or
+                           (rx_s0_q and v_rxd) or
+                           (rx_s1_q and v_rxd);
 
-                  if rx_odd_l = '0' then
-                    parity_expected_v := parity_even(rx_shift, rx_char_bits_l);
+                  if rx_odd_q = '0' then
+                    v_parity_expected := parity_even(rx_shift_q, rx_char_bits_q);
                   else
-                    parity_expected_v := parity_odd(rx_shift, rx_char_bits_l);
+                    v_parity_expected := parity_odd(rx_shift_q, rx_char_bits_q);
                   end if;
 
-                  rx_pe_latched <= parity_expected_v xor bit_v;
-                  v_state       := RX_STOP;
+                  rx_pe_latched_q := v_parity_expected xor v_bit;
+                  v_rx_state      := RX_STOP;
                 end if;
 
               when RX_STOP =>
-                if rx_sample_pos = sample_first_idx then
-                  rx_s0 <= rxd_v;
-                elsif rx_sample_pos = sample_center_idx then
-                  rx_s1 <= rxd_v;
-                elsif rx_sample_pos = sample_last_idx then
-                  bit_v := (rx_s0 and rx_s1) or
-                           (rx_s0 and rxd_v) or
-                           (rx_s1 and rxd_v);
+                if rx_sample_pos_q = v_sample_first then
+                  rx_s0_q := v_rxd;
+                elsif rx_sample_pos_q = v_sample_center then
+                  rx_s1_q := v_rxd;
+                elsif rx_sample_pos_q = v_sample_last then
+                  v_bit := (rx_s0_q and rx_s1_q) or
+                           (rx_s0_q and v_rxd) or
+                           (rx_s1_q and v_rxd);
 
-                  v_complete   := true;
-                  v_stop_err   := not bit_v;
-                  v_pe_err     := rx_pe_latched and '1' when rx_parity_en_l else '0';
+                  v_complete := true;
+                  v_stop_err := not v_bit;
 
-                  if rx_char_bits_l = 9 then
-                    v_frame_type := rx_shift(8);
+                  if rx_parity_en_q then
+                    v_pe_err := rx_pe_latched_q;
                   else
-                    v_frame_type := bit_v;  -- first stop bit as frame type
+                    v_pe_err := '0';
                   end if;
 
-                  v_state := RX_IDLE;
+                  if rx_char_bits_q = 9 then
+                    v_frame_type := rx_shift_q(8);
+                  else
+                    v_frame_type := v_bit;
+                  end if;
+
+                  v_rx_state := RX_IDLE;
                 end if;
 
               when others =>
-                v_state := RX_IDLE;
+                v_rx_state := RX_IDLE;
+
             end case;
           end if;
 
-          -------------------------------------------------------------
-          -- Asynchronous start-bit detection.
-          -- Done after the sample-tick state machine so that a frame
-          -- completing this cycle can be followed immediately by a new
-          -- start bit detection.
-          -------------------------------------------------------------
-          if v_state = RX_IDLE and rxd_v = '0' and prev_v = '1' then
-            -- New start bit detected.
-            -- If a completed frame was still waiting in the shift register,
-            -- it is lost now and DOR must be set.
-            if v_shift_full = '1' then
-              v_dor_pending := '1';
-              v_shift_full  := '0';
-            end if;
-
-            -- Latch frame configuration for this frame.
-            rx_char_bits_l <= char_bits;
-            rx_parity_en_l <= parity_en;
-            rx_odd_l       <= UPM0;
-            rx_mpcm_l      <= MPCM;
-
-            rx_shift       <= (others => '0');
-            rx_bit_cnt     <= 0;
-            rx_s0          <= '0';
-            rx_s1          <= '0';
-            rx_pe_latched  <= '0';
-
-            rx_start_reset <= '1';
-            v_state        := RX_START;
-          end if;
-
-        ---------------------------------------------------------------
-        -- Synchronous receiver
-        ---------------------------------------------------------------
         else
-          if xck_sample_event = '1' then
-            case v_state is
+
+          if v_xck_sample then
+            case v_rx_state is
+
               when RX_IDLE =>
-                -- Synchronous reception uses the start bit sampled on XCK.
-                if rxd_v = '0' then
+                if v_rxd = '0' then
                   if v_shift_full = '1' then
                     v_dor_pending := '1';
                     v_shift_full  := '0';
                   end if;
 
-                  rx_char_bits_l <= char_bits;
-                  rx_parity_en_l <= parity_en;
-                  rx_odd_l       <= UPM0;
-                  rx_mpcm_l      <= MPCM;
+                  rx_char_bits_q := v_char_bits;
+                  rx_parity_en_q := v_parity_en;
+                  rx_odd_q       := upm0_q;
+                  rx_mpcm_q      := mpcm_q;
 
-                  rx_shift       <= (others => '0');
-                  rx_bit_cnt     <= 0;
-                  rx_pe_latched  <= '0';
+                  rx_shift_q      := (others => '0');
+                  rx_bit_cnt_q    := 0;
+                  rx_pe_latched_q := '0';
 
-                  -- Start bit accepted; next sample edge is data bit 0.
-                  v_state := RX_DATA;
+                  v_rx_state := RX_DATA;
                 end if;
 
               when RX_DATA =>
-                rx_shift(rx_bit_cnt) <= rxd_v;
+                rx_shift_q(rx_bit_cnt_q) := v_rxd;
 
-                if rx_bit_cnt = rx_char_bits_l - 1 then
-                  if rx_parity_en_l then
-                    v_state := RX_PARITY;
+                if rx_bit_cnt_q = rx_char_bits_q - 1 then
+                  if rx_parity_en_q then
+                    v_rx_state := RX_PARITY;
                   else
-                    v_state := RX_STOP;
+                    v_rx_state := RX_STOP;
                   end if;
                 else
-                  rx_bit_cnt <= rx_bit_cnt + 1;
+                  rx_bit_cnt_q := rx_bit_cnt_q + 1;
                 end if;
 
               when RX_PARITY =>
-                if rx_odd_l = '0' then
-                  parity_expected_v := parity_even(rx_shift, rx_char_bits_l);
+                if rx_odd_q = '0' then
+                  v_parity_expected := parity_even(rx_shift_q, rx_char_bits_q);
                 else
-                  parity_expected_v := parity_odd(rx_shift, rx_char_bits_l);
+                  v_parity_expected := parity_odd(rx_shift_q, rx_char_bits_q);
                 end if;
 
-                rx_pe_latched <= parity_expected_v xor rxd_v;
-                v_state       <= RX_STOP;
+                rx_pe_latched_q := v_parity_expected xor v_rxd;
+                v_rx_state      := RX_STOP;
 
               when RX_STOP =>
                 v_complete := true;
-                v_stop_err := not rxd_v;
+                v_stop_err := not v_rxd;
 
-                if rx_parity_en_l then
-                  v_pe_err := rx_pe_latched;
+                if rx_parity_en_q then
+                  v_pe_err := rx_pe_latched_q;
                 else
                   v_pe_err := '0';
                 end if;
 
-                if rx_char_bits_l = 9 then
-                  v_frame_type := rx_shift(8);
+                if rx_char_bits_q = 9 then
+                  v_frame_type := rx_shift_q(8);
                 else
-                  v_frame_type := rxd_v;  -- first stop bit as frame type
+                  v_frame_type := v_rxd;
                 end if;
 
-                v_state := RX_IDLE;
+                v_rx_state := RX_IDLE;
 
               when others =>
-                v_state := RX_IDLE;
+                v_rx_state := RX_IDLE;
+
             end case;
           end if;
+
         end if;
 
-        ---------------------------------------------------------------
-        -- Frame completion handling:
-        --   * MPCM filtering
-        --   * direct FIFO push if space
-        --   * otherwise hold in shift register as third buffer level
-        ---------------------------------------------------------------
+        -----------------------------------------------------------------
+        -- Frame completion handling
+        -----------------------------------------------------------------
         if v_complete then
-          if rx_mpcm_l = '0' or v_frame_type = '1' then
-            if fifo_full_i = '0' and not v_push then
-              -- Direct push into FIFO.
-              v_push := true;
-              v_data := rx_shift;
-              v_fe   := v_stop_err;
-              v_dor  := v_dor_pending;
-              v_pe   := v_pe_err;
+          v_frame_accept := (rx_mpcm_q = '0') or (v_frame_type = '1');
+
+          if v_frame_accept then
+            if v_cnt < 2 then
+              v_fifo(v_wr).data := rx_shift_q;
+              v_fifo(v_wr).fe   := v_stop_err;
+              v_fifo(v_wr).dor  := v_dor_pending;
+              v_fifo(v_wr).pe   := v_pe_err;
+
+              if v_wr = 0 then
+                v_wr := 1;
+              else
+                v_wr := 0;
+              end if;
+
+              v_cnt := v_cnt + 1;
 
               v_dor_pending := '0';
             else
-              -- FIFO full: keep completed frame in shift register.
-              rx_pending_data <= rx_shift;
-              rx_pending_fe   <= v_stop_err;
-              rx_pending_dor  <= v_dor_pending;
-              rx_pending_pe   <= v_pe_err;
+              if v_shift_full = '1' then
+                v_dor_pending := '1';
+              end if;
 
-              v_shift_full := '1';
+              rx_pending_data_q := rx_shift_q;
+              rx_pending_fe_q   := v_stop_err;
+              rx_pending_dor_q  := v_dor_pending;
+              rx_pending_pe_q   := v_pe_err;
+
+              v_shift_full  := '1';
+              v_dor_pending := '0';
             end if;
           end if;
         end if;
 
-        ---------------------------------------------------------------
-        -- Final FIFO push mux
-        ---------------------------------------------------------------
-        if v_push then
-          fifo_push      <= '1';
-          fifo_push_data <= v_data;
-          fifo_push_fe   <= v_fe;
-          fifo_push_dor  <= v_dor;
-          fifo_push_pe   <= v_pe;
-        else
-          fifo_push <= '0';
+        -----------------------------------------------------------------
+        -- Asynchronous start-bit detection
+        -- This occurs after completion handling so a just-completed
+        -- frame can be treated as pending before a new start bit.
+        -----------------------------------------------------------------
+        if umsel_q = '0' then
+          if v_rx_state = RX_IDLE and v_rxd = '0' and v_rx_prev = '1' then
+            if v_shift_full = '1' then
+              v_dor_pending := '1';
+              v_shift_full  := '0';
+            end if;
+
+            rx_char_bits_q := v_char_bits;
+            rx_parity_en_q := v_parity_en;
+            rx_odd_q       := upm0_q;
+            rx_mpcm_q      := mpcm_q;
+
+            rx_shift_q      := (others => '0');
+            rx_bit_cnt_q    := 0;
+            rx_s0_q         := '0';
+            rx_s1_q         := '0';
+            rx_pe_latched_q := '0';
+
+            v_rx_state        := RX_START;
+            v_rx_counter_reset := true;
+          end if;
         end if;
+
+        -----------------------------------------------------------------
+        -- Commit receiver local state
+        -----------------------------------------------------------------
+        rx_state_q       := v_rx_state;
+        rx_shift_full_q  := v_shift_full;
+        rx_dor_pending_q := v_dor_pending;
+
+        if v_rx_counter_reset then
+          baud_cnt_q      := 0;
+          rx_sample_pos_q := 0;
+        end if;
+
+        -----------------------------------------------------------------
+        -- Commit FIFO state and buffered status
+        -----------------------------------------------------------------
+        fifo_q     := v_fifo;
+        fifo_wr_q  := v_wr;
+        fifo_rd_q  := v_rd;
+        fifo_cnt_q := v_cnt;
+
+        if v_cnt > 0 then
+          rxc_q      := '1';
+          head_data_q := v_fifo(v_rd).data;
+          head_fe_q   := v_fifo(v_rd).fe;
+          head_dor_q  := v_fifo(v_rd).dor;
+          head_pe_q   := v_fifo(v_rd).pe;
+          rxb8_q      := v_fifo(v_rd).data(8);
+        else
+          rxc_q      := '0';
+          head_data_q := (others => '0');
+          head_fe_q   := '0';
+          head_dor_q  := '0';
+          head_pe_q   := '0';
+          rxb8_q      := '0';
+        end if;
+
       end if;
 
-      -----------------------------------------------------------------
-      -- Commit local variables to signals
-      -----------------------------------------------------------------
-      rx_state       <= v_state;
-      rx_shift_full  <= v_shift_full;
-      rx_dor_pending <= v_dor_pending;
     end if;
-  end process rx_proc;
 
-  -- ===================================================================
-  -- Receive FIFO process
-  -- ===================================================================
-  fifo_proc : process (clk, reset)
-    variable v_count           : integer range 0 to 2;
-    variable v_wr              : integer range 0 to 1;
-    variable v_rd              : integer range 0 to 1;
-    variable v_pop             : boolean;
-    variable v_push            : boolean;
-    variable v_count_after_pop : integer range 0 to 2;
-    variable v_head_is_push    : boolean;
-  begin
-    if reset = '1' then
-      fifo_wr_ptr <= 0;
-      fifo_rd_ptr <= 0;
-      fifo_cnt    <= 0;
+    -------------------------------------------------------------------
+    -- Drive outputs from variables
+    -------------------------------------------------------------------
+    tx_out  <= tx_out_q;
+    xck_out <= xck_out_q;
+    xck_oe  <= xck_oe_q;
+    dout    <= dout_q;
 
-      rxc_i       <= '0';
-      fifo_full_i <= '0';
-      fifo_empty_i<= '1';
-
-      head_data   <= (others => '0');
-      head_fe     <= '0';
-      head_dor    <= '0';
-      head_pe     <= '0';
-      rxb8_i      <= '0';
-
-      fifo(0).data <= (others => '0');
-      fifo(0).fe   <= '0';
-      fifo(0).dor  <= '0';
-      fifo(0).pe   <= '0';
-
-      fifo(1).data <= (others => '0');
-      fifo(1).fe   <= '0';
-      fifo(1).dor  <= '0';
-      fifo(1).pe   <= '0';
-
-    elsif rising_edge(clk) then
-      if RXEN = '0' then
-        -- Immediate receiver flush
-        fifo_wr_ptr  <= 0;
-        fifo_rd_ptr  <= 0;
-        fifo_cnt     <= 0;
-
-        rxc_i        <= '0';
-        fifo_full_i  <= '0';
-        fifo_empty_i <= '1';
-
-        head_data    <= (others => '0');
-        head_fe      <= '0';
-        head_dor     <= '0';
-        head_pe      <= '0';
-        rxb8_i       <= '0';
-
-        fifo(0).data <= (others => '0');
-        fifo(0).fe   <= '0';
-        fifo(0).dor  <= '0';
-        fifo(0).pe   <= '0';
-
-        fifo(1).data <= (others => '0');
-        fifo(1).fe   <= '0';
-        fifo(1).dor  <= '0';
-        fifo(1).pe   <= '0';
-
-      else
-        v_count        := fifo_cnt;
-        v_wr           := fifo_wr_ptr;
-        v_rd           := fifo_rd_ptr;
-        v_head_is_push := false;
-
-        -------------------------------------------------------------
-        -- Pop
-        -------------------------------------------------------------
-        v_pop := (fifo_pop = '1' and v_count > 0);
-        if v_pop then
-          fifo(v_rd).data <= (others => '0');
-          fifo(v_rd).fe   <= '0';
-          fifo(v_rd).dor  <= '0';
-          fifo(v_rd).pe   <= '0';
-
-          v_rd    := (v_rd + 1) mod 2;
-          v_count := v_count - 1;
-        end if;
-
-        v_count_after_pop := v_count;
-
-        -------------------------------------------------------------
-        -- Push
-        -------------------------------------------------------------
-        v_push := (fifo_push = '1' and v_count < 2);
-        if v_push then
-          fifo(v_wr).data <= fifo_push_data;
-          fifo(v_wr).fe   <= fifo_push_fe;
-          fifo(v_wr).dor  <= fifo_push_dor;
-          fifo(v_wr).pe   <= fifo_push_pe;
-
-          v_wr    := (v_wr + 1) mod 2;
-          v_count := v_count + 1;
-
-          -- If FIFO became non-empty only because of this push,
-          -- the new head must be bypassed from the push inputs.
-          if v_count_after_pop = 0 then
-            v_head_is_push := true;
-          end if;
-        end if;
-
-        -------------------------------------------------------------
-        -- Update pointers / count
-        -------------------------------------------------------------
-        fifo_wr_ptr <= v_wr;
-        fifo_rd_ptr <= v_rd;
-        fifo_cnt    <= v_count;
-
-        -------------------------------------------------------------
-        -- Status / head outputs
-        -------------------------------------------------------------
-        if v_count = 2 then
-          fifo_full_i <= '1';
-        else
-          fifo_full_i <= '0';
-        end if;
-
-        if v_count = 0 then
-          fifo_empty_i <= '1';
-        else
-          fifo_empty_i <= '0';
-        end if;
-
-        if v_count > 0 then
-          rxc_i <= '1';
-
-          if v_head_is_push then
-            head_data <= fifo_push_data;
-            head_fe   <= fifo_push_fe;
-            head_dor  <= fifo_push_dor;
-            head_pe   <= fifo_push_pe;
-            rxb8_i    <= fifo_push_data(8);
-          else
-            head_data <= fifo(v_rd).data;
-            head_fe   <= fifo(v_rd).fe;
-            head_dor  <= fifo(v_rd).dor;
-            head_pe   <= fifo(v_rd).pe;
-            rxb8_i    <= fifo(v_rd).data(8);
-          end if;
-        else
-          rxc_i      <= '0';
-          head_data  <= (others => '0');
-          head_fe    <= '0';
-          head_dor   <= '0';
-          head_pe    <= '0';
-          rxb8_i     <= '0';
-        end if;
-      end if;
+    if txen_q = '1' or tx_buf_full_q = '1' or tx_state_q /= TX_IDLE then
+      v_tx_oe := '1';
+    else
+      v_tx_oe := '0';
     end if;
-  end process fifo_proc;
 
-  -- ===================================================================
-  -- Asynchronous sample generator / clock recovery timer
-  -- ===================================================================
-  baud_proc : process (clk, reset)
-    variable v_cnt : integer range 0 to 4095;
-  begin
-    if reset = '1' then
-      v_cnt          := 0;
-      rx_sample_tick <= '0';
-      rx_sample_pos  <= 0;
+    tx_oe <= v_tx_oe;
 
-    elsif rising_edge(clk) then
-      rx_sample_tick <= '0';
+    rx_irq   <= rxc_q and rxcie_q;
+    tx_irq   <= txc_q and txcie_q;
+    udre_irq <= udre_q and udrie_q;
 
-      if rx_start_reset = '1' or ubrrl_write_pulse = '1' or UMSEL = '1' then
-        v_cnt         := 0;
-        rx_sample_pos <= 0;
-
-      elsif UMSEL = '0' then
-        if v_cnt >= ubrr_val then
-          v_cnt          := 0;
-          rx_sample_tick <= '1';
-
-          if rx_sample_pos >= samples_per_bit - 1 then
-            rx_sample_pos <= 0;
-          else
-            rx_sample_pos <= rx_sample_pos + 1;
-          end if;
-        else
-          v_cnt := v_cnt + 1;
-        end if;
-      else
-        v_cnt         := 0;
-        rx_sample_pos <= 0;
-      end if;
-    end if;
-  end process baud_proc;
-
-  -- ===================================================================
-  -- XCK synchronizer / master clock generator
-  -- ===================================================================
-  xck_proc : process (clk, reset)
-  begin
-    if reset = '1' then
-      xck_sync <= (others => '0');
-      xck_q    <= '0';
-      xck_cnt  <= 0;
-      xck_out  <= '0';
-      xck_oe   <= '0';
-
-    elsif rising_edge(clk) then
-      -- Synchronize external XCK for slave mode.
-      xck_sync <= xck_sync(1 downto 0) & xck_in;
-
-      if UMSEL = '1' and ddr_xck = '1' then
-        -------------------------------------------------------------
-        -- Master mode: drive XCK output enable
-        -------------------------------------------------------------
-        xck_oe <= '1';
-
-        if master_run_i = '1' then
-          if master_edge_event = '1' then
-            xck_q   <= not xck_q;
-            xck_out <= not xck_q;
-            xck_cnt <= 0;
-          else
-            xck_out <= xck_q;
-            xck_cnt <= xck_cnt + 1;
-          end if;
-        else
-          -- Idle level chosen so that the first generated edge is a
-          -- data-change edge for the selected UCPOL.
-          xck_cnt <= 0;
-          if UCPOL = '1' then
-            xck_q   <= '1';
-            xck_out <= '1';
-          else
-            xck_q   <= '0';
-            xck_out <= '0';
-          end if;
-        end if;
-
-      else
-        -------------------------------------------------------------
-        -- Slave mode or asynchronous mode: do not drive XCK
-        -------------------------------------------------------------
-        xck_oe  <= '0';
-        xck_out <= '0';
-        xck_cnt <= 0;
-
-        if UCPOL = '1' then
-          xck_q <= '1';
-        else
-          xck_q <= '0';
-        end if;
-      end if;
-    end if;
-  end process xck_proc;
+  end process main_proc;
 
 end architecture rtl;
