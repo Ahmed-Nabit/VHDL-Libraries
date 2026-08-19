@@ -17,3 +17,4 @@ VHDL Libraries:
   * TWI or I2C
   * CAN
   * TSN Endpoint
+  * PCIe Gen 4
