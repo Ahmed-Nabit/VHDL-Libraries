@@ -16,3 +16,4 @@ VHDL Libraries:
   * USART
   * TWI or I2C
   * CAN
+  * TSN Endpoint
